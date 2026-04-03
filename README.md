@@ -74,26 +74,34 @@ Postman Mock Server ──► mock response ──► Backend Service ──► 
 
 For each tenant/product, the Postman resources are organized as follows:
 
-```
-Workspace (1 per tenant)
-  └── Spec in Spec Hub (1 per version)
-       └── Generated Collection (1 per spec, linked/synced to the spec)
-            └── Mock Server (1 per collection)
-```
+- **1 Workspace per tenant** — contains all specs, collections, and mock servers for that product.
+- **1 Spec per version** — the OpenAPI YAML uploaded to Postman's Spec Hub.
+- **1 Collection per spec** — generated from and synced to its spec. When the spec is updated and synced, the collection reflects the changes.
+- **1 Mock Server per collection** — powered by the collection. When the collection updates, the mock server automatically serves the updated responses.
+
+The relationship is **1:1:1** — each version has exactly one spec, one collection, and one mock server. Specs, collections, and mock servers are all top-level resources within the workspace, linked to each other.
 
 **Example for CommerceHub:**
 ```
 Workspace: "CommerceHub"
-  ├── Spec: "CommerceHub - v1.25.2000"
-  │    └── Collection: "CommerceHub - v1.25.2000"
-  │         └── Mock Server: "CommerceHub - v1.25.2000 Mock"
-  │              → mockUrl: https://<mock-id>.mock.pstmn.io
-  ├── Spec: "CommerceHub - v1.26.0202"
-  │    └── Collection: "CommerceHub - v1.26.0202"
-  │         └── Mock Server: "CommerceHub - v1.26.0202 Mock"
-  │              → mockUrl: https://<mock-id>.mock.pstmn.io
-  └── ... (one spec → collection → mock per version)
+  │
+  ├── Specs
+  │    ├── "CommerceHub - v1.25.2000"
+  │    ├── "CommerceHub - v1.25.3000"
+  │    └── "CommerceHub - v1.26.0202"
+  │
+  ├── Collections (each generated from & synced to its respective spec)
+  │    ├── "CommerceHub - v1.25.2000"   ←→ synced to spec v1.25.2000
+  │    ├── "CommerceHub - v1.25.3000"   ←→ synced to spec v1.25.3000
+  │    └── "CommerceHub - v1.26.0202"   ←→ synced to spec v1.26.0202
+  │
+  └── Mock Servers (each powered by its respective collection)
+       ├── "CommerceHub - v1.25.2000 Mock"  → https://<id-1>.mock.pstmn.io
+       ├── "CommerceHub - v1.25.3000 Mock"  → https://<id-2>.mock.pstmn.io
+       └── "CommerceHub - v1.26.0202 Mock"  → https://<id-3>.mock.pstmn.io
 ```
+
+**The chain of updates:** Spec updated → sync collection → collection reflects changes → mock server automatically serves updated responses.
 
 ---
 
@@ -957,14 +965,18 @@ The backfill script provisions Postman resources for all existing specs. This is
 ### 6.1 Prerequisites
 
 - A Postman API key with permissions to create workspaces, specs, collections, and mock servers.
-- Access to the GitHub repository containing all OpenAPI spec files.
-- Access to MongoDB to read the existing `tenant_mock_api` collection and write to the new collections.
+- Access to MongoDB to read the existing `tenant_mock_api` collection (discovery source) and write to the new `postman_tenants` and `postman_resources` collections.
+- Access to the GitHub repository containing the OpenAPI spec YAML files (the backfill fetches full YAML files using the `fileName` and `branchName` from `tenant_mock_api` records).
 
-### 6.2 Input
+### 6.2 Input & Discovery Strategy
 
-The backfill script needs a list of `SpecEntry` objects — one per tenant + version combination. Each entry contains the tenant name, version, file name, branch name, and the full YAML content as a string.
+The existing `tenant_mock_api` MongoDB collection is the discovery source — it already knows every tenant + version combination that is actively served on the portal. The backfill script:
 
-You will need to write a `discoverSpecs()` function that traverses your GitHub repository and produces this list. This could also be derived from the existing `tenant_mock_api` MongoDB collection by grouping by `tenantName` and extracting unique versions from comboKeys — though you'd still need to fetch the original full YAML files from GitHub (the MongoDB records only contain per-endpoint chunks, not the full spec).
+1. **Queries `tenant_mock_api`** to discover all unique `tenantName + version` combinations (by grouping comboKeys or using a distinct/aggregation query). Each record also has the `fileName` and `branchName`.
+2. **Fetches the full YAML file from GitHub** for each combination using the `fileName` and `branchName` from the record. This is necessary because the MongoDB records only contain per-endpoint Prism operation chunks, not the original full OpenAPI spec file.
+3. **Feeds each entry** into the provisioning workflow.
+
+This approach ensures you only provision mock servers for specs that are actually in use on the portal — no risk of provisioning orphaned or unused specs.
 
 ### 6.3 Pseudocode
 
@@ -1123,40 +1135,99 @@ async function provisionSpecVersion(
   }
 }
 
-// ─── Main backfill function ──────────────────────────────────────
-// This function takes a list of spec entries and provisions them.
-// YOU must implement discoverSpecs() to traverse your GitHub directory
-// structure and produce this list — see section 6.4.
+// ─── Helper: Fetch full YAML from GitHub ─────────────────────────
+// YOU must implement this function based on your GitHub setup.
+// It should fetch the raw file content from your GitHub repository
+// using the fileName and branchName from the tenant_mock_api record.
+//
+// Options:
+//   - GitHub API: GET /repos/{owner}/{repo}/contents/{path}?ref={branch}
+//   - Direct raw URL: https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
+//   - Local clone: fs.readFileSync() if you have the repo checked out
+//
+async function fetchYamlFromGitHub(
+  tenantName: string,
+  fileName: string,
+  branchName: string
+): Promise<string> {
+  // Example using GitHub API (implement based on your setup):
+  // const response = await fetch(
+  //   `https://api.github.com/repos/${GITHUB_ORG}/${tenantName}/contents/${fileName}?ref=${branchName}`,
+  //   { headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github.raw' } }
+  // );
+  // return await response.text();
 
-interface SpecEntry {
-  tenantName: string;    // e.g., "CommerceHub"
-  version: string;       // e.g., "1.26.0202"
-  fileName: string;      // GitHub file path, e.g., "reference/1.26.0202/openapi.yaml"
-  branchName: string;    // e.g., "main"
-  yamlContent: string;   // Full YAML file content as a string
+  throw new Error('fetchYamlFromGitHub() not implemented — see comments above');
 }
 
-async function backfill(specs: SpecEntry[], db: Db) {
+// ─── Main backfill function ──────────────────────────────────────
+// Discovers all unique tenant+version combinations from the existing
+// tenant_mock_api MongoDB collection, fetches the full YAML from GitHub,
+// and provisions the Postman resources.
+
+async function backfill(db: Db) {
+  const tenantMockApi = db.collection('tenant_mock_api');
   const postmanTenants = db.collection('postman_tenants');
   const postmanResources = db.collection('postman_resources');
 
-  // Create indexes
+  // Create indexes for the new collections
   await postmanTenants.createIndex({ tenantName: 1 }, { unique: true });
   await postmanResources.createIndex({ tenantName: 1, version: 1 }, { unique: true });
   await postmanResources.createIndex({ tenantName: 1 });
 
-  // Group specs by tenant for workspace reuse
-  const specsByTenant = new Map<string, SpecEntry[]>();
+  // ── Step 1: Discover unique tenant + version combinations from MongoDB ──
+  // Each comboKey has format: {tenantName}_{apiPath}_{method}_{version}
+  // Multiple comboKeys share the same spec file (one per endpoint).
+  // We group by tenantName + fileName + branchName to get unique spec files.
+  const uniqueSpecs = await tenantMockApi.aggregate([
+    { $match: { comboKey: { $ne: null } } },
+    {
+      $group: {
+        _id: { tenantName: '$tenantName', fileName: '$fileName', branchName: '$branchName' },
+        // Extract version from any comboKey in the group (last segment after final underscore)
+        sampleComboKey: { $first: '$comboKey' },
+      },
+    },
+  ]).toArray();
+
+  console.log(`Discovered ${uniqueSpecs.length} unique spec files across all tenants.\n`);
+
+  // Parse version from comboKey and build the spec list
+  interface DiscoveredSpec {
+    tenantName: string;
+    version: string;
+    fileName: string;
+    branchName: string;
+  }
+
+  const specs: DiscoveredSpec[] = uniqueSpecs.map((doc) => {
+    const { tenantName, fileName, branchName } = doc._id;
+    // Extract version: last segment of comboKey after the final underscore
+    // e.g., "CommerceHub_/payments-vas/v1/3ds/authenticate_post_1.26.0101" → "1.26.0101"
+    const comboKey: string = doc.sampleComboKey;
+    const lastUnderscoreIdx = comboKey.lastIndexOf('_');
+    const secondLastIdx = comboKey.lastIndexOf('_', lastUnderscoreIdx - 1);
+    const version = comboKey.substring(secondLastIdx + 1).replace(/^[a-z]+_/, '');
+    // More robust: split from right — method is second-to-last, version is last
+    const parts = comboKey.split('_');
+    const versionFromParts = parts[parts.length - 1];
+
+    return { tenantName, version: versionFromParts, fileName, branchName };
+  });
+
+  // Group by tenant
+  const specsByTenant = new Map<string, DiscoveredSpec[]>();
   for (const spec of specs) {
     const existing = specsByTenant.get(spec.tenantName) || [];
     existing.push(spec);
     specsByTenant.set(spec.tenantName, existing);
   }
 
+  // ── Step 2: Process each tenant ──
   for (const [tenantName, tenantSpecs] of specsByTenant) {
-    console.log(`\nProcessing tenant: ${tenantName}`);
+    console.log(`Processing tenant: ${tenantName} (${tenantSpecs.length} version(s))`);
 
-    // Step 1: Ensure workspace exists for this tenant
+    // Ensure workspace exists for this tenant
     let tenantRecord = await postmanTenants.findOne({ tenantName });
 
     if (!tenantRecord) {
@@ -1187,15 +1258,25 @@ async function backfill(specs: SpecEntry[], db: Db) {
       console.log(`  Workspace already exists: ${tenantRecord.postmanWorkspaceId}`);
     }
 
-    // Step 2: Process each version for this tenant
+    // ── Step 3: Process each version — fetch YAML from GitHub and provision ──
     for (const spec of tenantSpecs) {
+      console.log(`  Fetching YAML from GitHub: ${spec.fileName} (branch: ${spec.branchName})`);
+
+      let yamlContent: string;
+      try {
+        yamlContent = await fetchYamlFromGitHub(spec.tenantName, spec.fileName, spec.branchName);
+      } catch (error) {
+        console.error(`  ✗ Failed to fetch YAML for ${spec.tenantName} v${spec.version}: ${error.message}`);
+        continue;
+      }
+
       await provisionSpecVersion(
         tenantRecord.postmanWorkspaceId,
         spec.tenantName,
         spec.version,
         spec.fileName,
         spec.branchName,
-        spec.yamlContent,
+        yamlContent,
         db
       );
     }
@@ -1207,33 +1288,31 @@ async function backfill(specs: SpecEntry[], db: Db) {
 
 ### 6.4 Running the Backfill
 
-The backfill script expects a list of `SpecEntry` objects (see the `interface SpecEntry` in section 6.3). **You need to implement a `discoverSpecs()` function** that traverses your GitHub repository's directory structure and produces this list.
-
-Since your team knows the GitHub directory structure best, write the parsing logic to:
-1. Walk through the repository and find all OpenAPI YAML files for each tenant/product.
-2. Extract the `tenantName`, `version`, `fileName`, and `branchName` from the file paths.
-3. Read the file content as a string.
-4. Return an array of `SpecEntry` objects.
+**Before running,** you must implement the `fetchYamlFromGitHub()` function (see section 6.3). This function takes a `tenantName`, `fileName`, and `branchName` — all of which come from the existing `tenant_mock_api` records — and returns the full YAML file content from your GitHub repository.
 
 **Example usage:**
 ```typescript
-// You implement this based on your GitHub directory structure
-const specs: SpecEntry[] = await discoverSpecs('/path/to/your/github/repo');
-
 // Connect to MongoDB
 const db = await DatabaseManager.getDatabase();
 
 // Set the environment variable before running:
 //   export POSTMAN_API_KEY="your-api-key"
 
-// Run the backfill
-await backfill(specs, db);
+// Run the backfill — it discovers specs from tenant_mock_api automatically
+await backfill(db);
 ```
 
-**Key properties of the backfill script:**
-- It is **idempotent** — it checks for existing records before creating resources. If a run is interrupted, you can safely re-run it and it will skip already-provisioned versions and retry errored ones.
-- It groups specs by tenant automatically, so workspaces are only created once per tenant regardless of the order of the input list.
-- Failed provisions are marked with `status: "error"` in MongoDB so they can be identified and retried.
+**How it works:**
+1. Queries `tenant_mock_api` to discover all unique `tenantName + fileName + branchName` combinations via aggregation.
+2. Extracts the `version` from the comboKey (last segment, e.g., `1.26.0202`).
+3. Groups by tenant — creates one workspace per tenant.
+4. For each version, calls `fetchYamlFromGitHub()` to get the full YAML, then runs the provisioning workflow (spec → collection → mock server).
+
+**Key properties:**
+- **MongoDB-driven discovery** — only provisions specs that are actively served on the portal. No need to know or traverse the GitHub directory structure.
+- **Idempotent** — checks for existing `postman_resources` records before creating resources. Safe to re-run after interruptions; skips already-provisioned versions and retries errored ones.
+- **Automatic tenant grouping** — workspaces are only created once per tenant.
+- **Error isolation** — a failed GitHub fetch or Postman API call for one version does not block other versions. Failed provisions are marked with `status: "error"` in MongoDB for identification and retry.
 
 ### 6.5 Post-Backfill Verification
 
