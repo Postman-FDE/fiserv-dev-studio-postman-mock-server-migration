@@ -304,7 +304,11 @@ POST /specs?workspaceId=<workspaceId>
 
 **Accepted `type` values:** `OPENAPI:2.0`, `OPENAPI:3.0`, `OPENAPI:3.1`
 
-> **Important:** The `content` field must contain the full YAML file content as a string. The `path` field is the filename within the spec — use `"openapi.yaml"` consistently. Files cannot exceed 10 MB.
+> **Important:** The `content` field must contain the full YAML file as a **JSON-escaped string** — newlines as `\n`, double quotes as `\"`, backslashes as `\\`, tabs as `\t`, and any other control characters as `\uXXXX`. A typical OpenAPI YAML contains all of these (multi-line indentation, quoted `description` / `example` values, `pattern:` regexes), so the request body **must** be assembled through a real JSON serializer that handles escaping for you (e.g., Jackson `ObjectMapper.writeValueAsString(...)`, Gson `Gson().toJson(...)`, `JSON.stringify(...)`, Python `json.dumps(...)`) — passing the raw YAML string as a value. **Do not** concatenate or template the YAML into a JSON skeleton; the embedded newlines and quotes will produce a malformed body and the API will reject the request with `HTTP 400 "The JSON submitted is invalid, please check the syntax"` before any spec validation runs.
+>
+> The `path` field is the filename within the spec — use `"openapi.yaml"` consistently. Files cannot exceed 10 MB. UTF-8 encoding is fine; there are no charset-specific requirements.
+>
+> A reference request body in the canonical shape, with a real escaped `content` value, is available in Postman's public workspace: [Create a spec — example](https://www.postman.com/postman/postman-public-workspace/example/12959542-6e5f003c-7511-474d-b2c0-898a4dfd20a1?sideView=agentMode).
 
 **Response (201 Created):**
 ```json
