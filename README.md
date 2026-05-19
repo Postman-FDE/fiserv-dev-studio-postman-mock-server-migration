@@ -23,6 +23,8 @@
 
 The architecture has **two pipelines** that share a common Backend Service:
 
+> **A note on environments and Postman cloud.** Fiserv runs four environments (`dev`, `qa`, `stage`, `prod`). Each environment has its own Backend Service instance and its own isolated MongoDB. Postman, however, has a single cloud — so workspaces from all four environments are provisioned into the same Postman tenant. To keep them distinguishable, workspace names append the environment (e.g., `DNA - dev`). Every other resource (spec, collection, mock server) lives inside its environment's workspace, so the environment is implicit beyond that point. See §8.10 for the full model.
+
 ### 1.1 Ingestion Pipeline (Provisioning Postman Resources)
 
 ```
@@ -52,8 +54,8 @@ Dev Studio UI
     ▼
 Backend Service
     │
-    │  1. Construct comboKey from request params
-    │  2. Lookup postmanMockServerBaseUrl from MongoDB
+    │  1. Resolve {tenantName, branchName, filePath} from request params via a Fiserv-owned utility
+    │  2. Lookup postmanMockServerUrl from MongoDB (postman_resources)
     │  3. Proxy request to Postman mock server
     │
     ▼
@@ -62,44 +64,46 @@ Postman Mock Server ──► mock response ──► Backend Service ──► 
 
 **Flow:**
 1. The Dev Studio UI sends the same GraphQL mutation (`RunTenantApiSandboxAtlas`) it sends today, with `productName`, `requestType`, `requestPath`, `apiVersion`, `requestBody`, `requestHeaders`, etc.
-2. The Backend Service constructs the `comboKey` the same way it does today: `{productName}_{apiFullPath}_{requestType}_{apiVersion}`.
-3. Instead of looking up a raw spec from MongoDB and spinning up an ephemeral Prism server, the Backend Service now:
-   - Looks up the `postmanMockServerBaseUrl` from MongoDB using the comboKey.
-   - Makes an HTTP request to `{postmanMockServerBaseUrl}{requestPath}` with the appropriate method, headers, and body.
+2. The Backend Service calls a Fiserv-owned utility — `resolveSpecLocation(request)` — that returns `{tenantName, branchName, filePath}`. The mechanism here is Fiserv's domain (e.g., a static map, a derived path, a separate lookup table). See §5.2.
+3. With that triple, the Backend Service:
+   - Looks up `postmanMockServerUrl` in `postman_resources` by `{tenantName, branchName, filePath}`.
+   - Makes an HTTP request to `{postmanMockServerUrl}{requestPath}` with the appropriate method, headers, and body.
 4. Returns the Postman mock server's response to the Dev Studio UI.
 
 **The Dev Studio UI requires zero changes.** The swap happens entirely within the Backend Service.
 
 ### 1.3 Postman Resource Hierarchy
 
-For each tenant/product, the Postman resources are organized as follows:
+For each `(tenant, environment)` pair, the Postman resources are organized as follows:
 
-- **1 Workspace per tenant** — contains all specs, collections, and mock servers for that product.
-- **1 Spec per version** — the OpenAPI YAML uploaded to Postman's Spec Hub.
+- **1 Workspace per `(tenant, environment)`** — contains all specs, collections, and mock servers for that product within that environment.
+- **N Specs per version** — multiple OpenAPI YAML files can live under the same version directory in the tenant's GitHub repo (different products, services, etc. under `reference/{version}/`). Each YAML file becomes its own Spec Hub entry.
 - **1 Collection per spec** — generated from and synced to its spec. When the spec is updated and synced, the collection reflects the changes.
 - **1 Mock Server per collection** — powered by the collection. When the collection updates, the mock server automatically serves the updated responses.
 
-The relationship is **1:1:1** — each version has exactly one spec, one collection, and one mock server. Specs, collections, and mock servers are all top-level resources within the workspace, linked to each other.
+The relationship between Spec ↔ Collection ↔ Mock Server is still **1:1:1**. But for a single `{tenantName, version}` pair, there can be **multiple specs** — one per file under the tenant's GitHub `reference/{version}/` directory, and additionally one per branch that the environment ingests from. Specs, collections, and mock servers are all top-level resources within the workspace, linked to each other.
 
-**Example for CommerceHub:**
+**Example for the DNA tenant in the `dev` environment:**
 ```
-Workspace: "CommerceHub"
+Workspace: "DNA - dev"
   │
   ├── Specs
-  │    ├── "CommerceHub - v1.25.2000"
-  │    ├── "CommerceHub - v1.25.3000"
-  │    └── "CommerceHub - v1.26.0202"
+  │    ├── "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"
+  │    ├── "DNA - develop - 11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml"
+  │    └── "DNA - preview - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"
   │
   ├── Collections (each generated from & synced to its respective spec)
-  │    ├── "CommerceHub - v1.25.2000"   ←→ synced to spec v1.25.2000
-  │    ├── "CommerceHub - v1.25.3000"   ←→ synced to spec v1.25.3000
-  │    └── "CommerceHub - v1.26.0202"   ←→ synced to spec v1.26.0202
+  │    ├── "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"
+  │    ├── "DNA - develop - 11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml"
+  │    └── "DNA - preview - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"
   │
   └── Mock Servers (each powered by its respective collection)
-       ├── "CommerceHub - v1.25.2000 Mock"  → https://<id-1>.mock.pstmn.io
-       ├── "CommerceHub - v1.25.3000 Mock"  → https://<id-2>.mock.pstmn.io
-       └── "CommerceHub - v1.26.0202 Mock"  → https://<id-3>.mock.pstmn.io
+       ├── "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml Mock"  → https://<id-1>.mock.pstmn.io
+       ├── "DNA - develop - 11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml Mock"   → https://<id-2>.mock.pstmn.io
+       └── "DNA - preview - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml Mock"  → https://<id-3>.mock.pstmn.io
 ```
+
+Parallel workspaces — `DNA - qa`, `DNA - stage`, `DNA - prod` — exist for the other environments. All four live in the same Postman cloud and are provisioned by the four env-scoped Backend Service instances, each reading and writing its own env-isolated MongoDB.
 
 **The chain of updates:** Spec updated → sync collection → collection reflects changes → mock server automatically serves updated responses.
 
@@ -107,17 +111,17 @@ Workspace: "CommerceHub"
 
 ## 2. MongoDB Schema Design
 
-The migration introduces **two new MongoDB collections** alongside the existing `tenant_mock_api` collection. The existing collection remains largely unchanged — only one new field is added.
+The migration introduces **two new MongoDB collections** — `postman_tenants` and `postman_resources` — within each environment's MongoDB instance. The previous `tenant_mock_api` collection is being retired as part of this migration; no schema there is touched.
 
 ### 2.1 New Collection: `postman_tenants`
 
-**Purpose:** Maps each tenant/product to its Postman workspace. This is a simple lookup table used to determine whether a workspace already exists for a given tenant.
+**Purpose:** Maps each tenant/product to its Postman workspace within the current environment. This is a simple lookup table used to determine whether a workspace already exists for a given tenant in this environment.
 
-**One document per tenant.**
+**One document per tenant** (within each env-scoped MongoDB instance).
 
 ```typescript
 interface PostmanTenant {
-  tenantName: string;              // e.g., "CommerceHub" — unique index
+  tenantName: string;              // e.g., "DNA" — unique index
   postmanWorkspaceId: string;      // e.g., "1f0df51a-8658-4ee8-a2a1-d2567dfa09a9"
   status: "provisioning" | "ready" | "error";
   createdAt: Date;
@@ -126,12 +130,14 @@ interface PostmanTenant {
 ```
 
 **Indexes:**
-- Unique index on `tenantName`
+- Unique index on `tenantName` (each env's MongoDB is isolated, so `tenantName` alone is unique within an env's DB).
 
-**Example document:**
+> The current environment is implicit via the env-scoped MongoDB connection and is NOT stored on the document. The Backend Service reads `environmentName` from its own app config when constructing the workspace name (see §3.1 / §7), but the value never round-trips through MongoDB.
+
+**Example document (from the dev environment's MongoDB):**
 ```json
 {
-  "tenantName": "CommerceHub",
+  "tenantName": "DNA",
   "postmanWorkspaceId": "1f0df51a-8658-4ee8-a2a1-d2567dfa09a9",
   "status": "ready",
   "createdAt": "2026-04-01T00:00:00.000Z",
@@ -141,18 +147,18 @@ interface PostmanTenant {
 
 ### 2.2 New Collection: `postman_resources`
 
-**Purpose:** Stores the full set of Postman resource IDs for each spec-version combination. This is the primary lookup table used by the usage pipeline to resolve a comboKey to a mock server URL.
+**Purpose:** Stores the full set of Postman resource IDs for each spec file. This is the primary lookup table used by the usage pipeline to resolve a request to a mock server URL.
 
-**One document per tenant + version combination.**
+**One document per `(tenant, branch, filePath)` combination** — i.e., one document per spec file per branch within the env-scoped MongoDB. A single `{tenantName, version}` can have many documents because multiple files can live under the same `reference/{version}/` directory and across multiple branches.
 
 ```typescript
 interface PostmanResource {
-  tenantName: string;              // e.g., "CommerceHub"
-  version: string;                 // e.g., "1.26.0202"
-  fileName: string;                // e.g., "reference/1.26.0202/openapi.yaml"
-  branchName: string;              // e.g., "main"
+  tenantName: string;              // e.g., "DNA"
+  branchName: string;              // e.g., "develop", "preview", "stage", "main" — from GitHub webhook
+  filePath: string;                // full webhook path, e.g., "reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"
+  version: string;                 // derived from filePath (first segment after "reference/"), e.g., "11.0.0" — stored for query convenience, NOT in lookup
+  fileName: string;                // leaf only, e.g., "AddressService-11.0.0_DNA.yaml" — stored for convenience, NOT in lookup
   postmanSpecId: string;           // Spec Hub spec ID
-  postmanSpecFilePath: string;     // File path within the spec, e.g., "openapi.yaml"
   postmanCollectionId: string;     // Plain collection ID (UUID) — used for GET/DELETE operations
   postmanCollectionUid: string;    // Collection UID (ownerId-collectionId) — used for mock creation and sync
   postmanMockServerId: string;     // Mock server ID
@@ -164,19 +170,22 @@ interface PostmanResource {
 }
 ```
 
-**Indexes:**
-- Compound unique index on `{ tenantName, version }`
-- Index on `tenantName` (for listing all versions of a tenant)
+> The spec's internal file path (the `path` field used when uploading to Postman's Spec Hub) is **not** stored — it's a code-level constant, `SPEC_FILE_PATH = "openapi.yaml"`. See §3.3 and §3.4.
 
-**Example document:**
+**Indexes:**
+- Compound unique index on `{ tenantName, branchName, filePath }` — this is the real identifier for a single spec/collection/mock triple, and the lookup key used by the usage pipeline.
+
+> Environment is implicit via the env-scoped MongoDB connection and is NOT stored on the document.
+
+**Example document (from the dev environment's MongoDB):**
 ```json
 {
-  "tenantName": "CommerceHub",
-  "version": "1.26.0202",
-  "fileName": "reference/1.26.0202/openapi.yaml",
-  "branchName": "main",
+  "tenantName": "DNA",
+  "branchName": "develop",
+  "filePath": "reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml",
+  "version": "11.0.0",
+  "fileName": "AddressService-11.0.0_DNA.yaml",
   "postmanSpecId": "b4fc1bdc-6587-4f9b-95c9-f768146089b4",
-  "postmanSpecFilePath": "openapi.yaml",
   "postmanCollectionId": "12ece9e1-2abf-4edc-8e34-de66e74114d2",
   "postmanCollectionUid": "12345678-12ece9e1-2abf-4edc-8e34-de66e74114d2",
   "postmanMockServerId": "e3d951bf-873f-49ac-a658-b2dcb91d3289",
@@ -186,14 +195,6 @@ interface PostmanResource {
   "updatedAt": "2026-04-01T00:00:00.000Z"
 }
 ```
-
-### 2.3 Existing Collection: `tenant_mock_api` (No Change)
-
-The existing `tenant_mock_api` collection stores one document per comboKey (per endpoint per version). The usage pipeline no longer needs the `spec` field to spin up Prism — it now resolves to a Postman mock server URL via the `postman_resources` collection instead.
-
-Since the comboKey already contains the `tenantName` and `version`, the Backend Service can parse these out and look up `postman_resources` directly. **No schema change is needed to `tenant_mock_api`.**
-
-The Backend Service uses the request parameters (`productName`, `apiVersion`) that are already available in the incoming GraphQL mutation variables to look up the corresponding `postman_resources` record. The existing `tenant_mock_api` collection stays completely untouched.
 
 ---
 
@@ -218,21 +219,21 @@ POST /workspaces
 ```json
 {
   "workspace": {
-    "name": "CommerceHub",
+    "name": "DNA - dev",
     "type": "private",
-    "description": "Postman workspace for CommerceHub mock servers"
+    "description": "Postman workspace for DNA mock servers (dev environment)"
   }
 }
 ```
 
-> **Note:** The `type` must be `"private"` to ensure workspace contents are not publicly accessible.
+> **Note:** The `type` must be `"private"` to ensure workspace contents are not publicly accessible. Workspace name follows the convention `{tenantName} - {environmentName}` (see §7); the same tenant gets one workspace per Fiserv environment in the shared Postman cloud.
 
 **Response (200 OK):**
 ```json
 {
   "workspace": {
     "id": "1f0df51a-8658-4ee8-a2a1-d2567dfa09a9",
-    "name": "CommerceHub"
+    "name": "DNA - dev"
   }
 }
 ```
@@ -291,7 +292,7 @@ POST /specs?workspaceId=<workspaceId>
 **Request Body:**
 ```json
 {
-  "name": "CommerceHub - v1.26.0202",
+  "name": "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml",
   "type": "OPENAPI:3.0",
   "files": [
     {
@@ -306,14 +307,16 @@ POST /specs?workspaceId=<workspaceId>
 
 > **Important:** The `content` field must contain the full YAML file as a **JSON-escaped string** — newlines as `\n`, double quotes as `\"`, backslashes as `\\`, tabs as `\t`, and any other control characters as `\uXXXX`. A typical OpenAPI YAML contains all of these (multi-line indentation, quoted `description` / `example` values, `pattern:` regexes), so the request body **must** be assembled through a real JSON serializer that handles escaping for you (e.g., Jackson `ObjectMapper.writeValueAsString(...)`, Gson `Gson().toJson(...)`, `JSON.stringify(...)`, Python `json.dumps(...)`) — passing the raw YAML string as a value. **Do not** concatenate or template the YAML into a JSON skeleton; the embedded newlines and quotes will produce a malformed body and the API will reject the request with `HTTP 400 "The JSON submitted is invalid, please check the syntax"` before any spec validation runs.
 >
-> The `path` field is the filename within the spec — use `"openapi.yaml"` consistently. Files cannot exceed 10 MB. UTF-8 encoding is fine; there are no charset-specific requirements.
+> The `path` field is the spec's internal file path. Always use the **`SPEC_FILE_PATH` constant** (`"openapi.yaml"`) — this value is never parameterized and is not stored in `postman_resources`. Files cannot exceed 10 MB. UTF-8 encoding is fine; there are no charset-specific requirements.
+>
+> The `name` field follows the naming convention in §7: `{tenantName} - {branchName} - {pathFromVersion}`, where `pathFromVersion` is the webhook file path with the `reference/` prefix stripped.
 >
 > A reference request body in the canonical shape, with a real escaped `content` value, is available in Postman's public workspace: [Create a spec — example](https://www.postman.com/postman/postman-public-workspace/example/12959542-6e5f003c-7511-474d-b2c0-898a4dfd20a1?sideView=agentMode).
 
 **Response (201 Created):**
 ```json
 {
-  "name": "CommerceHub - v1.26.0202",
+  "name": "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml",
   "type": "OPENAPI:3.0",
   "id": "b4fc1bdc-6587-4f9b-95c9-f768146089b4",
   "createdAt": "2025-03-15T13:48:28.000Z",
@@ -330,11 +333,11 @@ POST /specs?workspaceId=<workspaceId>
 When a spec file is modified (e.g., new examples added, descriptions changed), update the file content in the existing spec.
 
 ```
-PATCH /specs/:specId/files/:filePath
+PATCH /specs/:specId/files/openapi.yaml
 ```
 
 - `:specId` — the spec's ID from `postman_resources.postmanSpecId`
-- `:filePath` — the file path within the spec (e.g., `openapi.yaml` from `postman_resources.postmanSpecFilePath`)
+- The file path segment is always the `SPEC_FILE_PATH` constant (`openapi.yaml`) — never parameterized and not stored.
 
 **Request Body:**
 ```json
@@ -408,7 +411,7 @@ POST /specs/:specId/generations/collection
 **Request Body:**
 ```json
 {
-  "name": "CommerceHub - v1.26.0202",
+  "name": "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml",
   "options": {
     "folderStrategy": "Tags",
     "includeDeprecated": true,
@@ -416,6 +419,8 @@ POST /specs/:specId/generations/collection
   }
 }
 ```
+
+> Collection name matches the spec name (see §7).
 
 > The `options` field is optional. See [OpenAPI to Postman Converter Options](https://github.com/postmanlabs/openapi-to-postman/blob/develop/OPTIONS.md) for all available options.
 
@@ -523,7 +528,7 @@ POST /mocks?workspace=<workspaceId>
 ```json
 {
   "mock": {
-    "name": "CommerceHub - v1.26.0202 Mock",
+    "name": "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml Mock",
     "collection": "12345678-12ece9e1-2abf-4edc-8e34-de66e74114d2",
     "private": false
   }
@@ -545,7 +550,7 @@ POST /mocks?workspace=<workspaceId>
     "uid": "12345678-e3d951bf-873f-49ac-a658-b2dcb91d3289",
     "collection": "12345678-12ece9e1-2abf-4edc-8e34-de66e74114d2",
     "mockUrl": "https://e3d951bf-873f-49ac-a658-b2dcb91d3289.mock.pstmn.io",
-    "name": "CommerceHub - v1.26.0202 Mock",
+    "name": "DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml Mock",
     "config": {
       "headers": [],
       "matchBody": false,
@@ -600,48 +605,84 @@ DELETE /collections/:collectionId
 
 ## 4. Ingestion Pipeline — Scenario Handling
 
-When a GitHub webhook fires indicating a spec file change, the Backend Service must determine which scenario applies and execute the corresponding workflow.
+Each Fiserv tenant has its own GitHub repository. An existing webhook listener service receives GitHub events and forwards a payload to the Backend Service. The payload carries the `tenantName`, `branchName`, and three arrays of file paths:
 
-### 4.0 Decision Tree
+```json
+{
+  "tenantName": "DNA",
+  "branchName": "develop",
+  "added":    ["reference/11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml"],
+  "removed":  ["reference/10.9.0/Accountholder/AddressService-10.9.0_DNA.yaml"],
+  "modified": ["reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"]
+}
+```
+
+> **Note (POC).** The exact payload shape above is illustrative — for the POC we assume this is what the webhook listener forwards, but the production payload may look different. What this design depends on is only that each event identifies (a) which spec file path(s) changed and (b) the action per path — added, modified, or removed. As long as those two pieces of information are reachable from the payload, the Backend Service can normalize the inputs into the iteration in §4.0.2 without any other changes to this design.
+
+The Backend Service iterates over each path in each array and routes it to the appropriate scenario.
+
+### 4.0.1 Webhook Path Parsing Convention
+
+All spec file paths follow the convention:
 
 ```
-Webhook received (tenantName, version, action)
+reference/{version}/<arbitrary intermediate directories>/{fileName}
+```
+
+From a path, derive:
+- `filePath` — the **full string** as received from the webhook (used as the storage key in `postman_resources`).
+- `version` — the segment immediately after `reference/` (first path segment).
+- `fileName` — the leaf segment (the YAML file name).
+- `pathFromVersion` — `filePath` with the `reference/` prefix stripped (used in resource naming, see §7).
+
+**Example:** for `reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml`:
+- `version` = `11.0.0`
+- `fileName` = `AddressService-11.0.0_DNA.yaml`
+- `pathFromVersion` = `11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml`
+
+### 4.0.2 Decision Tree
+
+For each `filePath` in each array (`added` / `modified` / `removed`):
+
+```
+For each entry in webhook (tenantName, branchName, filePath, arrayName):
     │
-    ├── action = "ADDED" or new file detected
+    ├── arrayName = "added"
     │   │
     │   ├── Does postman_tenants record exist for this tenantName?
     │   │   │
-    │   │   ├── NO  → Scenario 1: New tenant + new spec
-    │   │   └── YES → Does postman_resources record exist for this tenantName + version?
-    │   │       │
-    │   │       ├── NO  → Scenario 2: New version for existing tenant
-    │   │       └── YES → Scenario 3: Spec update (resource already provisioned)
+    │   │   ├── NO  → Scenario 1: New tenant + new spec file
+    │   │   └── YES → Scenario 2: New spec file in existing workspace
     │   │
-    ├── action = "MODIFIED"
+    ├── arrayName = "modified"
     │   │
-    │   └── Does postman_resources record exist for this tenantName + version?
+    │   └── Does postman_resources record exist for { tenantName, branchName, filePath }?
     │       │
-    │       ├── YES → Scenario 3: Spec update
-    │       └── NO  → Scenario 2: New version (treat as new if no resource exists)
-    │   
-    └── action = "DELETED"
+    │       ├── YES → Scenario 3: Spec file update
+    │       └── NO  → Scenario 2: Treat as new (defensive — webhook claims modify, but we have no record)
+    │
+    └── arrayName = "removed"
         │
-        └── Does this delete the last spec for this tenant?
+        └── After this delete, do any postman_resources records remain for this tenantName (within this env's MongoDB)?
             │
-            ├── NO  → Scenario 4: Spec/version deleted
-            └── YES → Scenario 5: Tenant deleted entirely
+            ├── YES → Scenario 4: Spec file deleted
+            └── NO  → Scenario 5: Tenant deleted entirely (workspace cleanup)
 ```
 
-### 4.1 Scenario 1: New Tenant + First Spec
+> A single webhook event can fan out into multiple scenario executions — e.g., a PR that adds two files and modifies one will trigger Scenario 2 twice and Scenario 3 once.
 
-**Trigger:** A spec file is added for a product/tenant that has never been provisioned before. No `postman_tenants` record exists for this `tenantName`.
+### 4.1 Scenario 1: New Tenant + First Spec File
+
+**Trigger:** A path in `added` arrives for a tenant that has never been provisioned in this environment. No `postman_tenants` record exists for this `tenantName`.
+
+**Inputs:** `tenantName`, `branchName`, `filePath` (full webhook path). The Backend Service also reads `environmentName` from its own config to construct the workspace name in Step 1 — it is not stored on any document. Derive `version`, `fileName`, `pathFromVersion` per §4.0.1.
 
 **Workflow:**
 
 ```
 Step 1: Create workspace
     POST /workspaces
-    Body: { workspace: { name: tenantName, type: "private", description: "..." } }
+    Body: { workspace: { name: "{tenantName} - {environmentName}", type: "private", description: "..." } }
     → Save workspaceId
 
 Step 2: (Optional) Set workspace roles to read-only for non-admins
@@ -661,15 +702,15 @@ Step 3: Save tenant record in MongoDB
 Step 4: Upload spec to Spec Hub
     POST /specs?workspaceId=<workspaceId>
     Body: {
-      name: "{tenantName} - v{version}",
+      name: "{tenantName} - {branchName} - {pathFromVersion}",
       type: "OPENAPI:3.0",
-      files: [{ path: "openapi.yaml", content: yamlFileContent }]
+      files: [{ path: SPEC_FILE_PATH, content: yamlFileContent }]   // SPEC_FILE_PATH = "openapi.yaml"
     }
     → Save specId
 
 Step 5: Generate collection from spec (async)
     POST /specs/:specId/generations/collection
-    Body: { name: "{tenantName} - v{version}", options: { ... } }
+    Body: { name: "{tenantName} - {branchName} - {pathFromVersion}", options: { ... } }
     → Get taskId
 
 Step 6: Poll for task completion
@@ -686,7 +727,7 @@ Step 8: Create mock server
     POST /mocks?workspace=<workspaceId>
     Body: {
       mock: {
-        name: "{tenantName} - v{version} Mock",
+        name: "{tenantName} - {branchName} - {pathFromVersion} Mock",
         collection: collectionUid,     ← must use UID here
         private: false
       }
@@ -697,11 +738,11 @@ Step 9: Save resource record in MongoDB
     Insert into postman_resources:
     {
       tenantName,
+      branchName,
+      filePath,
       version,
       fileName,
-      branchName,
       postmanSpecId: specId,
-      postmanSpecFilePath: "openapi.yaml",
       postmanCollectionId: collectionId,
       postmanCollectionUid: collectionUid,
       postmanMockServerId: mockServerId,
@@ -712,9 +753,12 @@ Step 9: Save resource record in MongoDB
     }
 ```
 
-### 4.2 Scenario 2: New Version for Existing Tenant
+### 4.2 Scenario 2: New Spec File in Existing Workspace
 
-**Trigger:** A new spec version is added for a tenant that already has a workspace. A `postman_tenants` record exists, but no `postman_resources` record exists for this specific version.
+**Trigger:** A path in `added` (or a `modified` path with no matching record) arrives for a tenant that already has a workspace in this environment. A `postman_tenants` record exists, but no `postman_resources` record exists for `{tenantName, branchName, filePath}`. This covers two real-world cases:
+- A new spec file added to a brand-new version directory.
+- A new spec file added under an existing version directory (different product or service under the same `reference/{version}/`).
+- A new branch ingested for a previously-seen file.
 
 **Workflow:**
 
@@ -722,20 +766,20 @@ Step 9: Save resource record in MongoDB
 Step 1: Look up existing workspace
     Find in postman_tenants: { tenantName }
     → Get workspaceId
-    (No new workspace needed)
+    (No new workspace needed — env is implicit via DB isolation)
 
 Step 2: Upload spec to Spec Hub
     POST /specs?workspaceId=<workspaceId>
     Body: {
-      name: "{tenantName} - v{version}",
+      name: "{tenantName} - {branchName} - {pathFromVersion}",
       type: "OPENAPI:3.0",
-      files: [{ path: "openapi.yaml", content: yamlFileContent }]
+      files: [{ path: SPEC_FILE_PATH, content: yamlFileContent }]
     }
     → Save specId
 
 Step 3: Generate collection from spec (async)
     POST /specs/:specId/generations/collection
-    Body: { name: "{tenantName} - v{version}", options: { ... } }
+    Body: { name: "{tenantName} - {branchName} - {pathFromVersion}", options: { ... } }
     → Get taskId
 
 Step 4: Poll for task completion
@@ -752,7 +796,7 @@ Step 6: Create mock server
     POST /mocks?workspace=<workspaceId>
     Body: {
       mock: {
-        name: "{tenantName} - v{version} Mock",
+        name: "{tenantName} - {branchName} - {pathFromVersion} Mock",
         collection: collectionUid,     ← must use UID here
         private: false
       }
@@ -763,11 +807,11 @@ Step 7: Save resource record in MongoDB
     Insert into postman_resources:
     {
       tenantName,
+      branchName,
+      filePath,
       version,
       fileName,
-      branchName,
       postmanSpecId: specId,
-      postmanSpecFilePath: "openapi.yaml",
       postmanCollectionId: collectionId,
       postmanCollectionUid: collectionUid,
       postmanMockServerId: mockServerId,
@@ -778,20 +822,21 @@ Step 7: Save resource record in MongoDB
     }
 ```
 
-### 4.3 Scenario 3: Existing Spec Updated
+### 4.3 Scenario 3: Existing Spec File Updated
 
-**Trigger:** An existing spec file is modified (e.g., new example responses added, descriptions changed, endpoints added/removed). A `postman_resources` record already exists for this `tenantName` + `version`.
+**Trigger:** A path in `modified` matches an existing `postman_resources` record for `{tenantName, branchName, filePath}`.
 
 **Workflow:**
 
 ```
 Step 1: Look up existing resource
-    Find in postman_resources: { tenantName, version }
-    → Get postmanSpecId, postmanSpecFilePath, postmanCollectionUid
+    Find in postman_resources: { tenantName, branchName, filePath }
+    → Get postmanSpecId, postmanCollectionUid
 
 Step 2: Update spec file content
-    PATCH /specs/:postmanSpecId/files/:postmanSpecFilePath
+    PATCH /specs/:postmanSpecId/files/openapi.yaml
     Body: { content: updatedYamlFileContent }
+    // file path segment is always the SPEC_FILE_PATH constant
 
 Step 3: Sync collection with updated spec (async)
     PUT /collections/:postmanCollectionUid/synchronizations?specId=<postmanSpecId>
@@ -802,7 +847,7 @@ Step 4: Poll for task completion
     → Poll every 2-3 seconds until status = "completed"
 
 Step 5: Update resource record in MongoDB
-    Update postman_resources where { tenantName, version }:
+    Update postman_resources where { tenantName, branchName, filePath }:
     {
       $set: {
         status: "ready",
@@ -813,15 +858,15 @@ Step 5: Update resource record in MongoDB
 
 > **Note:** The mock server does NOT need to be recreated or updated. Mock servers are powered by the collection — once the collection is synced with the updated spec, the mock server automatically reflects the changes.
 
-### 4.4 Scenario 4: Spec/Version Deleted
+### 4.4 Scenario 4: Spec File Deleted
 
-**Trigger:** A spec file for a specific version is deleted from GitHub, but other versions for the same tenant still exist.
+**Trigger:** A path in `removed` matches an existing `postman_resources` record, AND other `postman_resources` records still exist for this `tenantName` in this env's MongoDB.
 
 **Workflow:**
 
 ```
 Step 1: Look up existing resource
-    Find in postman_resources: { tenantName, version }
+    Find in postman_resources: { tenantName, branchName, filePath }
     → Get postmanMockServerId, postmanCollectionId, postmanCollectionUid, postmanSpecId
 
 Step 2: Delete mock server
@@ -834,21 +879,21 @@ Step 4: Delete spec
     DELETE /specs/:postmanSpecId
 
 Step 5: Remove resource record from MongoDB
-    Delete from postman_resources where { tenantName, version }
+    Delete from postman_resources where { tenantName, branchName, filePath }
 ```
 
 > **Deletion order matters:** Delete the mock server first, then the collection, then the spec. This avoids orphaned resources.
 
-### 4.5 Scenario 5: Tenant Deleted Entirely
+### 4.5 Scenario 5: Tenant Deleted Entirely (in this environment)
 
-**Trigger:** All spec files for a tenant are removed, or a tenant is decommissioned.
+**Trigger:** The last spec file for a tenant is removed within this env, or the tenant is decommissioned. Scope is `(tenant, environment)` — parallel workspaces in other envs (e.g., `DNA - prod`) are not affected.
 
 **Workflow:**
 
 ```
-Step 1: Get all resources for the tenant
+Step 1: Get all resources for the tenant (in this env's DB)
     Find all in postman_resources: { tenantName }
-    → List of all version resources
+    → List of remaining resource documents
 
 Step 2: For each resource, execute Scenario 4 (steps 2-5)
     Delete mock server → delete collection → delete spec → remove MongoDB record
@@ -871,44 +916,51 @@ This section describes how the Backend Service should change to serve mock respo
 ### 5.1 Current Flow (Prism — to be replaced)
 
 The current `runSandboxWithAtlas` function in the Backend Service:
-1. Receives the comboKey from the GraphQL request body.
-2. Looks up the spec from `tenant_mock_api` collection using `findOne({ comboKey })`.
+1. Receives request parameters from the GraphQL request body (`productName`, `apiVersion`, `requestPath`, `requestType`, etc.).
+2. Looks up the spec from MongoDB (the legacy `tenant_mock_api` lookup path).
 3. Parses the spec JSON.
 4. Creates an ephemeral Prism server via `createPrismMockServer(specOrURL)`.
 5. Sends the request payload to Prism and gets the mock response.
 6. Closes the Prism server.
 7. Returns the response to the UI.
 
+The legacy `tenant_mock_api` collection (and the comboKey concept that keyed into it) is **retired** as part of this migration. Neither survives in the new flow.
+
 ### 5.2 New Flow (Postman Mock Server)
 
-Replace the Prism logic with:
+The lookup is **single-step** against `postman_resources`, keyed by `{tenantName, branchName, filePath}`. The triple comes from a Fiserv-owned utility — `resolveSpecLocation(request)` — that translates the incoming GraphQL request into the corresponding spec file location. The utility's implementation is Fiserv's domain (similar to `fetchYamlFromGitHub()` in §6.3); this document only defines its **contract**.
+
+**`resolveSpecLocation(request)` contract:**
+- **Input:** the incoming request — at minimum `productName`, `apiVersion`, `requestPath`, `requestType` and any other GraphQL mutation variables the utility needs.
+- **Output:** `{ tenantName: string, branchName: string, filePath: string }`, where:
+  - `tenantName` matches the tenant whose GitHub repo owns this spec.
+  - `branchName` is the Git branch this environment currently serves for that tenant.
+  - `filePath` is the full webhook-style path (e.g., `reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml`) and matches `postman_resources.filePath`.
+
+The mechanism inside the utility is up to Fiserv — possibilities include a config-driven map, a derived rule based on `apiVersion` + `requestPath`, or a lightweight lookup against any new directory/inventory Fiserv chooses to maintain.
 
 ```typescript
 // Step 1: Receive the request (unchanged)
 const { body } = req;
-const { key: comboKey } = body;
-
-// Step 2: Extract tenantName and version from request parameters
-// These are already available in the incoming GraphQL mutation variables:
-//   productName, apiFullPath, requestType, apiVersion
-// Alternatively, parse them from the comboKey:
-//   comboKey format: "{productName}_{apiFullPath}_{requestType}_{version}"
-const productName = body.productName;   // e.g., "CommerceHub"
-const apiVersion = body.apiVersion;     // e.g., "1.26.0202"
 const requestPath = body.requestPath;   // e.g., "/payments-vas/v1/accounts/balance-inquiry"
 const requestType = body.requestType;   // e.g., "POST"
 
-// Step 3: Look up the Postman mock server URL
+// Step 2: Resolve where this request maps to in the spec catalog.
+// resolveSpecLocation() is YOUR utility (see contract above).
+const { tenantName, branchName, filePath } = await resolveSpecLocation(body);
+
+// Step 3: Look up the Postman mock server URL.
+// Lookup key: { tenantName, branchName, filePath }.
+// Environment is implicit via env-isolated MongoDB connection.
 const db = await DatabaseManager.getDatabase();
-const postmanResourcesCollection = db.collection('postman_resources');
-const resource = await postmanResourcesCollection.findOne({
-  tenantName: productName,
-  version: apiVersion
+const resource = await db.collection('postman_resources').findOne({
+  tenantName,
+  branchName,
+  filePath,
 });
 
 if (!resource || resource.status !== 'ready') {
-  // Fallback: resource not provisioned yet or in error state
-  res.status(503).json({ message: 'Mock server not available for this version' });
+  res.status(503).json({ message: 'Mock server not available for this spec file' });
   return;
 }
 
@@ -927,7 +979,6 @@ const headers = {
 
 // If the UI sends request headers (from body.payload.headers), forward relevant ones
 if (body?.payload?.headers) {
-  // Forward headers that may affect mock response matching
   Object.assign(headers, body.payload.headers);
 }
 
@@ -953,42 +1004,67 @@ res.end(JSON.stringify(mockResponse));
 ### 5.3 Key Differences from Prism Flow
 
 | Aspect | Prism (old) | Postman (new) |
-|--------|------------|---------------|
+|--------|-------------|---------------|
 | Server lifecycle | Ephemeral — spin up per request, then close | Persistent — pre-provisioned, always running |
-| Spec storage | Raw spec JSON in `tenant_mock_api.spec` | Managed by Postman Spec Hub |
+| Spec storage | Raw spec JSON in MongoDB (`tenant_mock_api`) | Managed by Postman Spec Hub |
 | Response generation | Local Prism library processes spec | Postman cloud generates response from collection examples |
-| Lookup | `comboKey` → spec content | `tenantName + version` → mock server URL |
+| Lookup | `comboKey` → spec content in `tenant_mock_api` | `resolveSpecLocation(request)` → `{tenantName, branchName, filePath}` → `postman_resources` → mock server URL |
 | Latency | Prism startup overhead per request | Direct HTTP call to running mock server |
 
 ---
 
 ## 6. Backfill Script — One-Time Migration
 
-The backfill script provisions Postman resources for all existing specs. This is a one-time operation run during the migration.
+The backfill script provisions Postman resources for all existing specs. This is a one-time operation **run once per environment** — four runs in total (dev, qa, stage, prod). Each run connects to its env's own MongoDB and uses its env name to construct workspace names; the env name itself is never persisted on a document.
 
 ### 6.1 Prerequisites
 
 - A Postman API key with permissions to create workspaces, specs, collections, and mock servers.
-- Access to MongoDB to read the existing `tenant_mock_api` collection (discovery source) and write to the new `postman_tenants` and `postman_resources` collections.
-- Access to the GitHub repository containing the OpenAPI spec YAML files (the backfill fetches full YAML files using the `fileName` and `branchName` from `tenant_mock_api` records).
+- Access to the env-scoped MongoDB to write the new `postman_tenants` and `postman_resources` collections. (The legacy `tenant_mock_api` collection is NOT read by the backfill.)
+- Access to each tenant's GitHub repository — one repo per tenant — so the backfill can list the spec files under `reference/{version}/…` and fetch their contents.
+- A configured mapping of branches per environment (which branches this env serves). See §8.7 for the recommended mapping.
+- The list of tenants to provision (e.g., from a config file or by enumerating the GitHub org).
+- An environment identifier (`dev`, `qa`, `stage`, or `prod`) available via app config / env var.
 
 ### 6.2 Input & Discovery Strategy
 
-The existing `tenant_mock_api` MongoDB collection is the discovery source — it already knows every tenant + version combination that is actively served on the portal. The backfill script:
+The backfill discovers what to provision **by walking each tenant's GitHub repo** for the branches this environment serves. For each `(tenantName, branchName)` pair, it lists every YAML file under `reference/{version}/…` and treats each file path as one provisioning unit.
 
-1. **Queries `tenant_mock_api`** to discover all unique `tenantName + version` combinations (by grouping comboKeys or using a distinct/aggregation query). Each record also has the `fileName` and `branchName`.
-2. **Fetches the full YAML file from GitHub** for each combination using the `fileName` and `branchName` from the record. This is necessary because the MongoDB records only contain per-endpoint Prism operation chunks, not the original full OpenAPI spec file.
-3. **Feeds each entry** into the provisioning workflow.
+For each environment, the script:
 
-This approach ensures you only provision mock servers for specs that are actually in use on the portal — no risk of provisioning orphaned or unused specs.
+1. **Enumerates `(tenantName, branchName)` pairs** for the tenants this env serves, using the configured branch-per-env mapping (§8.7).
+2. **Walks GitHub** for each pair — listing every file matching `reference/{version}/**/*.yaml` (or `*.yml`) on the given branch in the tenant's repo. Each listed path becomes the `filePath` stored in `postman_resources`.
+3. **Fetches the full YAML file from GitHub** for each path on its branch.
+4. **Feeds each `(tenantName, branchName, filePath)` triple** into the provisioning workflow.
+
+`environmentName` is read from the Backend Service's config and used to construct workspace names. It is not stored on any MongoDB document — env-scoped DBs already isolate each env's records. No cross-env coordination is required.
+
+Two Fiserv-owned utility functions are needed here. Both are left as stubs in the pseudocode below for Fiserv to implement (they depend on how Fiserv organizes its GitHub access):
+
+- **`listSpecFilesForTenantBranch(tenantName, branchName) → string[]`** — returns the list of webhook-style file paths (e.g., `reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml`) present on the given branch in the tenant's GitHub repo.
+- **`fetchYamlFromGitHub(tenantName, filePath, branchName) → string`** — returns the raw YAML content of one specific file.
 
 ### 6.3 Pseudocode
 
 ```typescript
 const POSTMAN_API_BASE = 'https://api.getpostman.com';
-const POSTMAN_API_KEY = process.env.POSTMAN_API_KEY;
+const POSTMAN_API_KEY  = process.env.POSTMAN_API_KEY;
+const ENVIRONMENT_NAME = process.env.ENVIRONMENT_NAME;   // "dev" | "qa" | "stage" | "prod"
+const SPEC_FILE_PATH   = 'openapi.yaml';                 // internal path inside every Postman spec
 const POLL_INTERVAL_MS = 3000;
 const MAX_POLL_ATTEMPTS = 60; // 3 minutes max wait
+
+// ─── Helper: parse webhook path ──────────────────────────────────
+// reference/{version}/.../{fileName}
+function parseFilePath(filePath: string): { version: string; fileName: string; pathFromVersion: string } {
+  const stripped = filePath.startsWith('reference/') ? filePath.slice('reference/'.length) : filePath;
+  const segments = stripped.split('/');
+  return {
+    version: segments[0],
+    fileName: segments[segments.length - 1],
+    pathFromVersion: stripped,
+  };
+}
 
 // ─── Helper: Postman API call ────────────────────────────────────
 async function postmanApi(method: string, endpoint: string, body?: any) {
@@ -1031,49 +1107,57 @@ async function pollTask(specId: string, taskId: string): Promise<any> {
   throw new Error(`Task timed out after ${MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS / 1000}s`);
 }
 
-// ─── Helper: Provision a single spec version ─────────────────────
-async function provisionSpecVersion(
+// ─── Helper: Provision a single spec file ────────────────────────
+async function provisionSpecFile(
   workspaceId: string,
   tenantName: string,
-  version: string,
-  fileName: string,
   branchName: string,
+  filePath: string,           // full webhook path
   yamlContent: string,
   db: Db
 ): Promise<void> {
   const postmanResources = db.collection('postman_resources');
+  const { version, fileName, pathFromVersion } = parseFilePath(filePath);
+  const resourceName = `${tenantName} - ${branchName} - ${pathFromVersion}`;
 
   // Check if already provisioned (idempotency)
-  const existing = await postmanResources.findOne({ tenantName, version });
+  const existing = await postmanResources.findOne({ tenantName, branchName, filePath });
   if (existing && existing.status === 'ready') {
-    console.log(`  Skipping ${tenantName} v${version} — already provisioned`);
+    console.log(`  Skipping ${resourceName} — already provisioned`);
     return;
   }
 
   // Set status to provisioning
   await postmanResources.updateOne(
-    { tenantName, version },
+    { tenantName, branchName, filePath },
     {
       $set: { status: 'provisioning', updatedAt: new Date() },
-      $setOnInsert: { tenantName, version, fileName, branchName, createdAt: new Date() }
+      $setOnInsert: {
+        tenantName,
+        branchName,
+        filePath,
+        version,
+        fileName,
+        createdAt: new Date(),
+      },
     },
     { upsert: true }
   );
 
   try {
     // Step 1: Upload spec
-    console.log(`  Uploading spec: ${tenantName} - v${version}`);
+    console.log(`  Uploading spec: ${resourceName}`);
     const specResult = await postmanApi('POST', `/specs?workspaceId=${workspaceId}`, {
-      name: `${tenantName} - v${version}`,
+      name: resourceName,
       type: 'OPENAPI:3.0',
-      files: [{ path: 'openapi.yaml', content: yamlContent }],
+      files: [{ path: SPEC_FILE_PATH, content: yamlContent }],
     });
     const specId = specResult.id;
 
     // Step 2: Generate collection (async)
     console.log(`  Generating collection for spec: ${specId}`);
     const genResult = await postmanApi('POST', `/specs/${specId}/generations/collection`, {
-      name: `${tenantName} - v${version}`,
+      name: resourceName,
       options: {
         folderStrategy: 'Tags',
         includeDeprecated: true,
@@ -1090,28 +1174,27 @@ async function provisionSpecVersion(
     // Step 4: Fetch collection details to get both plain ID and UID
     console.log(`  Fetching collection details for: ${collectionIdFromTask}`);
     const collectionDetails = await postmanApi('GET', `/collections/${collectionIdFromTask}`);
-    const collectionId = collectionDetails.collection.info._postman_id;
+    const collectionId  = collectionDetails.collection.info._postman_id;
     const collectionUid = collectionDetails.collection.info.uid;
 
     // Step 5: Create mock server (must use UID for the collection field)
     console.log(`  Creating mock server for collection: ${collectionUid}`);
     const mockResult = await postmanApi('POST', `/mocks?workspace=${workspaceId}`, {
       mock: {
-        name: `${tenantName} - v${version} Mock`,
+        name: `${resourceName} Mock`,
         collection: collectionUid,
         private: false,
       },
     });
-    const mockServerId = mockResult.mock.id;
+    const mockServerId  = mockResult.mock.id;
     const mockServerUrl = mockResult.mock.mockUrl;
 
     // Step 6: Update MongoDB
     await postmanResources.updateOne(
-      { tenantName, version },
+      { tenantName, branchName, filePath },
       {
         $set: {
           postmanSpecId: specId,
-          postmanSpecFilePath: 'openapi.yaml',
           postmanCollectionId: collectionId,
           postmanCollectionUid: collectionUid,
           postmanMockServerId: mockServerId,
@@ -1122,11 +1205,11 @@ async function provisionSpecVersion(
       }
     );
 
-    console.log(`  ✓ Done: ${tenantName} v${version} → ${mockServerUrl}`);
+    console.log(`  ✓ Done: ${resourceName} → ${mockServerUrl}`);
   } catch (error) {
     // Mark as error for retry
     await postmanResources.updateOne(
-      { tenantName, version },
+      { tenantName, branchName, filePath },
       {
         $set: {
           status: 'error',
@@ -1135,112 +1218,96 @@ async function provisionSpecVersion(
         },
       }
     );
-    console.error(`  ✗ Error provisioning ${tenantName} v${version}: ${error.message}`);
+    console.error(`  ✗ Error provisioning ${resourceName}: ${error.message}`);
   }
 }
 
-// ─── Helper: Fetch full YAML from GitHub ─────────────────────────
-// YOU must implement this function based on your GitHub setup.
-// It should fetch the raw file content from your GitHub repository
-// using the fileName and branchName from the tenant_mock_api record.
+// ─── Config: which tenants and which branches this env serves ────
+// Source these from your config — example shown inline for clarity.
+const TENANTS: string[] = ['DNA', 'CommerceHub', /* ... */];
+
+const BRANCHES_FOR_ENV: Record<string, string[]> = {
+  dev:   ['develop', 'preview'],
+  qa:    ['develop'],
+  stage: ['stage'],
+  prod:  ['main'],
+};
+
+// ─── Fiserv-owned helper: list spec files in a tenant's GitHub repo ───
+// YOU must implement this. It should return every webhook-style spec file path
+// under `reference/{version}/.../*.yaml` (or `.yml`) present on the given branch
+// in the tenant's repo. Examples:
+//   ["reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml",
+//    "reference/11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml", ...]
 //
-// Options:
-//   - GitHub API: GET /repos/{owner}/{repo}/contents/{path}?ref={branch}
-//   - Direct raw URL: https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
+// Implementation options:
+//   - GitHub API: GET /repos/{owner}/{tenantName}/git/trees/{branch}?recursive=1, filter to .yaml/.yml under reference/
+//   - Local clone: walk the filesystem of a checked-out copy of the branch
+//
+async function listSpecFilesForTenantBranch(
+  tenantName: string,
+  branchName: string,
+): Promise<string[]> {
+  throw new Error('listSpecFilesForTenantBranch() not implemented — see comments above');
+}
+
+// ─── Fiserv-owned helper: fetch full YAML from GitHub ────────────
+// YOU must implement this. It should fetch the raw file content from the tenant's
+// GitHub repository for a specific filePath on a specific branch.
+//
+// Implementation options:
+//   - GitHub API: GET /repos/{owner}/{tenantName}/contents/{filePath}?ref={branch}
+//   - Direct raw URL: https://raw.githubusercontent.com/{owner}/{tenantName}/{branch}/{filePath}
 //   - Local clone: fs.readFileSync() if you have the repo checked out
 //
 async function fetchYamlFromGitHub(
   tenantName: string,
-  fileName: string,
-  branchName: string
+  filePath: string,
+  branchName: string,
 ): Promise<string> {
-  // Example using GitHub API (implement based on your setup):
-  // const response = await fetch(
-  //   `https://api.github.com/repos/${GITHUB_ORG}/${tenantName}/contents/${fileName}?ref=${branchName}`,
-  //   { headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github.raw' } }
-  // );
-  // return await response.text();
-
   throw new Error('fetchYamlFromGitHub() not implemented — see comments above');
 }
 
 // ─── Main backfill function ──────────────────────────────────────
-// Discovers all unique tenant+version combinations from the existing
-// tenant_mock_api MongoDB collection, fetches the full YAML from GitHub,
-// and provisions the Postman resources.
+// Run once per environment. For each configured (tenant, branch) pair, walks
+// the tenant's GitHub repo for spec files, fetches each YAML, and provisions
+// the corresponding Postman workspace, spec, collection, and mock server.
 
 async function backfill(db: Db) {
-  const tenantMockApi = db.collection('tenant_mock_api');
-  const postmanTenants = db.collection('postman_tenants');
+  if (!ENVIRONMENT_NAME) {
+    throw new Error('ENVIRONMENT_NAME env var must be set (dev | qa | stage | prod)');
+  }
+
+  const branchesForThisEnv = BRANCHES_FOR_ENV[ENVIRONMENT_NAME];
+  if (!branchesForThisEnv || branchesForThisEnv.length === 0) {
+    throw new Error(`No branches configured for environment "${ENVIRONMENT_NAME}"`);
+  }
+
+  const postmanTenants   = db.collection('postman_tenants');
   const postmanResources = db.collection('postman_resources');
 
   // Create indexes for the new collections
   await postmanTenants.createIndex({ tenantName: 1 }, { unique: true });
-  await postmanResources.createIndex({ tenantName: 1, version: 1 }, { unique: true });
-  await postmanResources.createIndex({ tenantName: 1 });
+  await postmanResources.createIndex(
+    { tenantName: 1, branchName: 1, filePath: 1 },
+    { unique: true },
+  );
 
-  // ── Step 1: Discover unique tenant + version combinations from MongoDB ──
-  // Each comboKey has format: {tenantName}_{apiPath}_{method}_{version}
-  // Multiple comboKeys share the same spec file (one per endpoint).
-  // We group by tenantName + fileName + branchName to get unique spec files.
-  const uniqueSpecs = await tenantMockApi.aggregate([
-    { $match: { comboKey: { $ne: null } } },
-    {
-      $group: {
-        _id: { tenantName: '$tenantName', fileName: '$fileName', branchName: '$branchName' },
-        // Extract version from any comboKey in the group (last segment after final underscore)
-        sampleComboKey: { $first: '$comboKey' },
-      },
-    },
-  ]).toArray();
+  // ── Step 1: Process each tenant ──
+  for (const tenantName of TENANTS) {
+    console.log(`Processing tenant: ${tenantName}`);
 
-  console.log(`Discovered ${uniqueSpecs.length} unique spec files across all tenants.\n`);
-
-  // Parse version from comboKey and build the spec list
-  interface DiscoveredSpec {
-    tenantName: string;
-    version: string;
-    fileName: string;
-    branchName: string;
-  }
-
-  const specs: DiscoveredSpec[] = uniqueSpecs.map((doc) => {
-    const { tenantName, fileName, branchName } = doc._id;
-    // Extract version: last segment of comboKey after the final underscore
-    // e.g., "CommerceHub_/payments-vas/v1/3ds/authenticate_post_1.26.0101" → "1.26.0101"
-    const comboKey: string = doc.sampleComboKey;
-    const lastUnderscoreIdx = comboKey.lastIndexOf('_');
-    const secondLastIdx = comboKey.lastIndexOf('_', lastUnderscoreIdx - 1);
-    const version = comboKey.substring(secondLastIdx + 1).replace(/^[a-z]+_/, '');
-    // More robust: split from right — method is second-to-last, version is last
-    const parts = comboKey.split('_');
-    const versionFromParts = parts[parts.length - 1];
-
-    return { tenantName, version: versionFromParts, fileName, branchName };
-  });
-
-  // Group by tenant
-  const specsByTenant = new Map<string, DiscoveredSpec[]>();
-  for (const spec of specs) {
-    const existing = specsByTenant.get(spec.tenantName) || [];
-    existing.push(spec);
-    specsByTenant.set(spec.tenantName, existing);
-  }
-
-  // ── Step 2: Process each tenant ──
-  for (const [tenantName, tenantSpecs] of specsByTenant) {
-    console.log(`Processing tenant: ${tenantName} (${tenantSpecs.length} version(s))`);
-
-    // Ensure workspace exists for this tenant
+    // Ensure workspace exists for this tenant in this env
     let tenantRecord = await postmanTenants.findOne({ tenantName });
 
     if (!tenantRecord) {
-      console.log(`  Creating workspace for ${tenantName}`);
+      const workspaceName = `${tenantName} - ${ENVIRONMENT_NAME}`;
+      console.log(`  Creating workspace: ${workspaceName}`);
       const wsResult = await postmanApi('POST', '/workspaces', {
         workspace: {
-          name: tenantName,
+          name: workspaceName,
           type: 'private',
-          description: `Postman workspace for ${tenantName} mock servers. Auto-provisioned by Dev Studio migration.`,
+          description: `Postman workspace for ${tenantName} mock servers (${ENVIRONMENT_NAME} environment). Auto-provisioned by Dev Studio migration.`,
         },
       });
       const workspaceId = wsResult.workspace.id;
@@ -1262,85 +1329,109 @@ async function backfill(db: Db) {
       console.log(`  Workspace already exists: ${tenantRecord.postmanWorkspaceId}`);
     }
 
-    // ── Step 3: Process each version — fetch YAML from GitHub and provision ──
-    for (const spec of tenantSpecs) {
-      console.log(`  Fetching YAML from GitHub: ${spec.fileName} (branch: ${spec.branchName})`);
-
-      let yamlContent: string;
+    // ── Step 2: For each branch this env serves, list spec files and provision ──
+    for (const branchName of branchesForThisEnv) {
+      console.log(`  Listing spec files: ${tenantName} @ ${branchName}`);
+      let filePaths: string[];
       try {
-        yamlContent = await fetchYamlFromGitHub(spec.tenantName, spec.fileName, spec.branchName);
+        filePaths = await listSpecFilesForTenantBranch(tenantName, branchName);
       } catch (error) {
-        console.error(`  ✗ Failed to fetch YAML for ${spec.tenantName} v${spec.version}: ${error.message}`);
+        console.error(`  ✗ Failed to list specs for ${tenantName} @ ${branchName}: ${error.message}`);
         continue;
       }
+      console.log(`    Found ${filePaths.length} spec file(s) on ${branchName}`);
 
-      await provisionSpecVersion(
-        tenantRecord.postmanWorkspaceId,
-        spec.tenantName,
-        spec.version,
-        spec.fileName,
-        spec.branchName,
-        yamlContent,
-        db
-      );
+      for (const filePath of filePaths) {
+        console.log(`    Fetching YAML: ${filePath}`);
+        let yamlContent: string;
+        try {
+          yamlContent = await fetchYamlFromGitHub(tenantName, filePath, branchName);
+        } catch (error) {
+          console.error(`    ✗ Failed to fetch YAML for ${tenantName} ${branchName} ${filePath}: ${error.message}`);
+          continue;
+        }
+
+        await provisionSpecFile(
+          tenantRecord.postmanWorkspaceId,
+          tenantName,
+          branchName,
+          filePath,
+          yamlContent,
+          db,
+        );
+      }
     }
   }
 
-  console.log('\nBackfill complete.');
+  console.log(`\n[${ENVIRONMENT_NAME}] Backfill complete.`);
 }
 ```
 
 ### 6.4 Running the Backfill
 
-**Before running,** you must implement the `fetchYamlFromGitHub()` function (see section 6.3). This function takes a `tenantName`, `fileName`, and `branchName` — all of which come from the existing `tenant_mock_api` records — and returns the full YAML file content from your GitHub repository.
+The backfill is run **once per environment** — four total invocations (dev, qa, stage, prod). Each run connects to its own env's MongoDB, walks each tenant's GitHub repo for the branches this env serves, and stamps that env's name on every write.
 
-**Example usage:**
+**Before running,** implement the two Fiserv-owned helpers from §6.3:
+- `listSpecFilesForTenantBranch(tenantName, branchName)` — lists every spec file path on a branch.
+- `fetchYamlFromGitHub(tenantName, filePath, branchName)` — fetches one file's YAML content.
+
+Also confirm `TENANTS` and `BRANCHES_FOR_ENV` reflect Fiserv's actual configuration.
+
+**Example usage (per environment):**
 ```typescript
-// Connect to MongoDB
+// Set env vars before running:
+//   export POSTMAN_API_KEY="your-api-key"
+//   export ENVIRONMENT_NAME="dev"      // or "qa" / "stage" / "prod"
+
+// Connect to this environment's MongoDB
 const db = await DatabaseManager.getDatabase();
 
-// Set the environment variable before running:
-//   export POSTMAN_API_KEY="your-api-key"
-
-// Run the backfill — it discovers specs from tenant_mock_api automatically
 await backfill(db);
 ```
 
+Repeat for each of the four environments, each pointing at its own MongoDB instance.
+
 **How it works:**
-1. Queries `tenant_mock_api` to discover all unique `tenantName + fileName + branchName` combinations via aggregation.
-2. Extracts the `version` from the comboKey (last segment, e.g., `1.26.0202`).
-3. Groups by tenant — creates one workspace per tenant.
-4. For each version, calls `fetchYamlFromGitHub()` to get the full YAML, then runs the provisioning workflow (spec → collection → mock server).
+1. For the current env, looks up the branches it serves from `BRANCHES_FOR_ENV`.
+2. For each tenant in `TENANTS`, ensures a workspace exists in Postman named `{tenantName} - {environmentName}` and recorded in `postman_tenants`.
+3. For each `(tenantName, branchName)` pair, calls `listSpecFilesForTenantBranch()` to enumerate every spec file path on that branch.
+4. For each `filePath`, derives `version` / `fileName` / `pathFromVersion`, fetches the YAML via `fetchYamlFromGitHub()`, runs the provisioning workflow (spec → collection → mock server), and persists a `postman_resources` document keyed by `{tenantName, branchName, filePath}`.
 
 **Key properties:**
-- **MongoDB-driven discovery** — only provisions specs that are actively served on the portal. No need to know or traverse the GitHub directory structure.
-- **Idempotent** — checks for existing `postman_resources` records before creating resources. Safe to re-run after interruptions; skips already-provisioned versions and retries errored ones.
-- **Automatic tenant grouping** — workspaces are only created once per tenant.
-- **Error isolation** — a failed GitHub fetch or Postman API call for one version does not block other versions. Failed provisions are marked with `status: "error"` in MongoDB for identification and retry.
+- **GitHub-driven discovery** — the source of truth is each tenant's GitHub repo. No dependency on any legacy MongoDB collection.
+- **Per-env isolation** — each run reads/writes only its own MongoDB. No cross-env coordination.
+- **Idempotent** — checks for existing `postman_resources` records (by `{tenantName, branchName, filePath}`) before creating Postman resources. Safe to re-run after interruptions; skips already-provisioned files and retries errored ones.
+- **Automatic tenant grouping** — workspaces are created at most once per `(tenant, env)`.
+- **Error isolation** — a failed GitHub list/fetch or Postman API call for one spec file does not block others. Failed entries are marked `status: "error"` for identification and retry.
 
 ### 6.5 Post-Backfill Verification
 
-After the backfill completes:
+After each environment's backfill completes:
 
-1. **Check MongoDB:** Verify that `postman_tenants` has one record per tenant and `postman_resources` has one record per tenant+version with `status: "ready"`.
+1. **Check MongoDB:** Verify that `postman_tenants` has one record per tenant (in this env's DB) and `postman_resources` has one record per `{tenantName, branchName, filePath}` with `status: "ready"`.
 
-2. **Spot-check Postman:** Open a few workspaces in the Postman UI and verify that specs, collections, and mock servers are present and functional.
+2. **Spot-check Postman:** Open a few `{tenant} - {env}` workspaces in the Postman UI and verify that specs, collections, and mock servers are present and functional.
 
-3. **Test the usage pipeline:** Make a few test requests through the Dev Studio UI and verify that mock responses are being served from Postman instead of Prism.
+3. **Test the usage pipeline:** Make a few test requests through the Dev Studio UI in this environment and verify that mock responses are being served from Postman instead of Prism.
 
 ---
 
 ## 7. Naming Conventions
 
-These are recommended defaults. Adjust as needed to match your organization's standards.
-
 | Resource | Naming Pattern | Example |
-|----------|---------------|---------|
-| Workspace | `{tenantName}` | `CommerceHub` |
-| Spec | `{tenantName} - v{version}` | `CommerceHub - v1.26.0202` |
-| Spec file path | `openapi.yaml` | `openapi.yaml` |
-| Collection | `{tenantName} - v{version}` | `CommerceHub - v1.26.0202` |
-| Mock Server | `{tenantName} - v{version} Mock` | `CommerceHub - v1.26.0202 Mock` |
+|----------|----------------|---------|
+| Workspace | `{tenantName} - {environmentName}` | `DNA - dev` |
+| Spec | `{tenantName} - {branchName} - {pathFromVersion}` | `DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml` |
+| Spec internal file path (code constant) | `SPEC_FILE_PATH = "openapi.yaml"` | `openapi.yaml` |
+| Collection | same as Spec | same as Spec |
+| Mock Server | `{Spec name} Mock` | `DNA - develop - 11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml Mock` |
+
+Where:
+- `environmentName` ∈ `{"dev", "qa", "stage", "prod"}` (from Backend Service config).
+- `branchName` is the Git branch reported by the webhook (e.g., `develop`, `preview`, `stage`, `main`).
+- `pathFromVersion` is the webhook `filePath` with the `reference/` prefix stripped — e.g., `11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml`. The version is already the first segment of this path, so it's not repeated as a separate `v{version}` prefix.
+
+> Lookups never read the resource name; they query `postman_resources` by `{tenantName, branchName, filePath}`. The name exists only for human readability in the Postman UI.
 
 ---
 
@@ -1370,7 +1461,7 @@ The Fiserv Commerce Hub specs use `openapi: 3.0.2`, which maps to spec type `OPE
 
 ### 8.4 Spec File Size Limit
 
-Postman's spec file upload has a **10 MB limit** per file. The CommerceHub specs are ~300-500 KB, well within this limit. If any tenant has specs approaching 10 MB, consider whether they can be split or optimized.
+Postman's spec file upload has a **10 MB limit** per file. The Fiserv specs we've sampled (e.g., CommerceHub) are ~300–500 KB, well within this limit. If any tenant has specs approaching 10 MB, consider whether they can be split or optimized.
 
 ### 8.5 Collection Generation Options
 
@@ -1388,23 +1479,56 @@ Both collection generation (section 3.7) and collection sync (section 3.8) are a
 
 ### 8.7 Branch Handling
 
-The existing `tenant_mock_api` collection has a `branchName` field (values include `develop`, `preview`, `main`). The current implementation stores this field in `postman_resources` for reference, but the initial recommendation is to **provision Postman resources only for the production branch** (typically `main` or `active`). If Fiserv needs mock servers for multiple branches per version, the schema can be extended with `branchName` as part of the compound unique index on `postman_resources`.
+Branches are **first-class** in this design — they're part of the compound unique key on `postman_resources` (`{tenantName, branchName, filePath}`) and appear in spec / collection / mock server names.
 
-### 8.8 comboKey Parsing
+Each Backend Service instance ingests from one or more branches based on its environment. The current mapping (subject to confirmation per tenant):
 
-The comboKey format is: `{productName}_{apiFullPath}_{requestType}_{version}`
+| Environment | Ingests from branch(es) |
+|---|---|
+| `dev`   | `develop` (plus `preview` where used) |
+| `qa`    | `develop` |
+| `stage` | `stage` |
+| `prod`  | `main` |
 
-**Example:** `CommerceHub_/payments-vas/v1/3ds/authenticate_post_1.26.0101`
+A single workspace (e.g., `DNA - dev`) can therefore contain multiple specs that share the same file path but differ in `branchName` — for example, an `AddressService-…yaml` from `develop` alongside the same path from `preview`. This is expected; they are independent Postman resources.
 
-To parse the version from a comboKey, split from the right since the `apiFullPath` may contain underscores. However, in the usage pipeline (section 5), you should prefer using the original request parameters (`productName`, `apiVersion`) that are available in the GraphQL mutation variables — this avoids the complexity of parsing the comboKey.
-
-### 8.9 Fallback Strategy
+### 8.8 Fallback Strategy
 
 During the migration transition period, consider keeping the Prism fallback active:
 - If a `postman_resources` record is not found (status is not `"ready"`), fall back to the existing Prism flow.
 - This allows for a gradual rollout: backfill one tenant at a time and verify before moving on.
 - Once all tenants are migrated and verified, remove the Prism fallback code.
 
-### 8.10 Mock Server URL Caching
+### 8.9 Mock Server URL Caching
 
-Since the mock server URL for a given tenant+version changes very infrequently (only when the resource is deleted and recreated), consider caching the `postman_resources` lookup in memory with a TTL (e.g., 5 minutes). This eliminates the MongoDB lookup on every mock request.
+Since the mock server URL for a given `{tenantName, branchName, filePath}` changes very infrequently (only when the resource is deleted and recreated), consider caching the `postman_resources` lookup in memory with a TTL (e.g., 5 minutes). This eliminates the MongoDB lookup on every mock request.
+
+### 8.10 Environment Handling
+
+Postman has a **single cloud**; Fiserv has **four environments** (`dev`, `qa`, `stage`, `prod`). The reconciliation is per-environment workspaces in the same shared Postman tenant:
+
+- Each Fiserv environment runs its own Backend Service instance.
+- Each Backend Service instance has its own isolated MongoDB — env-scoped reads and writes.
+- All four instances target the **same Postman cloud**. They distinguish their resources by **workspace name only** — `{tenantName} - {environmentName}` (e.g., `DNA - dev`, `DNA - qa`, `DNA - stage`, `DNA - prod`).
+- `environmentName` is sourced from each Backend Service's app config (env var, config file, etc.) — **never** from the GitHub webhook payload.
+- `environmentName` is **not** stored on any MongoDB document. The env is implicit via the env-scoped MongoDB connection, so persisting it would just duplicate that value on every record. The Backend Service uses its config-supplied env name only when constructing the workspace name.
+
+Because the four MongoDB instances are independent, there is no global view of "all Postman resources for a tenant" within the database — the global view exists only in Postman (one workspace per env). For audit, query each env's MongoDB separately.
+
+### 8.11 Webhook Payload Structure
+
+The existing GitHub webhook listener service emits payloads in the following shape (other fields may also be present and can be ignored):
+
+```json
+{
+  "tenantName": "DNA",
+  "branchName": "develop",
+  "added":    ["reference/11.0.0/Accountholder/PersonService-11.0.0_DNA.yaml"],
+  "removed":  ["reference/10.9.0/Accountholder/AddressService-10.9.0_DNA.yaml"],
+  "modified": ["reference/11.0.0/Accountholder/AddressService-11.0.0_DNA.yaml"]
+}
+```
+
+**File path convention:** every path follows `reference/{version}/<arbitrary intermediate directories>/{fileName}`. A single tenant + version can therefore contain many different YAML files (one per product or service under that version's directory). See §4.0.1 for the parsing rules used to derive `version`, `fileName`, and `pathFromVersion`.
+
+The Backend Service iterates over each path in each array independently — one webhook event can therefore trigger several scenario executions in §4.
